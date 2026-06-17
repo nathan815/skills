@@ -400,6 +400,79 @@ async function handlePages(req, res, dashboardIdFromPath) {
   sendJson(res, result);
 }
 
+async function handleRefresh(req, res, dashboardIdFromPath) {
+  const dashboardId = dashboardIdFromPath || '*';
+
+  const actionId = randomUUID();
+  const action = {
+    id: actionId,
+    dashboardId,
+    type: 'refresh',
+    params: {},
+    createdAt: Date.now(),
+    result: null,
+    resolve: null
+  };
+
+  const resultPromise = new Promise((resolve) => {
+    action.resolve = resolve;
+  });
+
+  pendingActions.set(actionId, action);
+  notifyPollers();
+
+  const timeoutPromise = new Promise((resolve) =>
+    setTimeout(() => resolve({ timeout: true }), ACTION_TIMEOUT_MS)
+  );
+
+  const result = await Promise.race([resultPromise, timeoutPromise]);
+  pendingActions.delete(actionId);
+
+  if (result.timeout) {
+    return sendJson(res, { error: 'Timeout waiting for refresh' }, 504);
+  }
+
+  console.log(`[refresh] Dashboard ${dashboardId} refreshed`);
+  sendJson(res, result);
+}
+
+async function handleErrors(req, res, dashboardIdFromPath) {
+  const dashboardId = dashboardIdFromPath || '*';
+
+  const actionId = randomUUID();
+  const action = {
+    id: actionId,
+    dashboardId,
+    type: 'getErrors',
+    params: {},
+    createdAt: Date.now(),
+    result: null,
+    resolve: null
+  };
+
+  const resultPromise = new Promise((resolve) => {
+    action.resolve = resolve;
+  });
+
+  pendingActions.set(actionId, action);
+  notifyPollers();
+
+  const timeoutPromise = new Promise((resolve) =>
+    setTimeout(() => resolve({ timeout: true }), ACTION_TIMEOUT_MS)
+  );
+
+  const result = await Promise.race([resultPromise, timeoutPromise]);
+  pendingActions.delete(actionId);
+
+  if (result.timeout) {
+    return sendJson(res, { error: 'Timeout waiting for errors' }, 504);
+  }
+
+  const errorCount = result.errors?.length || 0;
+  console.log(`[getErrors] Dashboard ${dashboardId}: ${errorCount} tile error(s)`);
+  sendJson(res, result);
+}
+
 async function handleSelectPage(req, res, dashboardIdFromPath) {
   let data;
   try {
@@ -492,6 +565,12 @@ const server = http.createServer(async (req, res) => {
       } else if (subPath === 'edit' && req.method === 'POST') {
         // POST /dashboards/:id/edit
         await handleEdit(req, res, dashboardId);
+      } else if (subPath === 'refresh' && req.method === 'POST') {
+        // POST /dashboards/:id/refresh
+        await handleRefresh(req, res, dashboardId);
+      } else if (subPath === 'errors' && req.method === 'GET') {
+        // GET /dashboards/:id/errors
+        await handleErrors(req, res, dashboardId);
       } else {
         sendJson(res, { error: 'Not found' }, 404);
       }
@@ -514,17 +593,24 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║       ADX Dashboard Agent Server v2.1.0 (Node.js)         ║
-╠═══════════════════════════════════════════════════════════╣
-║  Listening on: http://localhost:${PORT.toString().padEnd(24)}║
-║                                                           ║
-║  Endpoints:                                               ║
-║    GET  /dashboard - Fetch current dashboard JSON         ║
-║    POST /edit      - Submit dashboard edit                ║
-║    GET  /poll      - Long-poll for commands (extension)   ║
-║    POST /result    - Report result (extension)            ║
-║    GET  /status    - Health check                         ║
-╚═══════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════════╗
+║         ADX Dashboard Agent Server v2.2.0 (Node.js)               ║
+╠═══════════════════════════════════════════════════════════════════╣
+║  Listening on: http://localhost:${PORT.toString().padEnd(30)}║
+║                                                                   ║
+║  Dashboard API:                                                   ║
+║    GET  /dashboards              - List connected dashboards      ║
+║    GET  /dashboards/:id          - Get dashboard JSON             ║
+║    GET  /dashboards/:id/pages    - List pages/tabs                ║
+║    POST /dashboards/:id/selectPage - Navigate to page             ║
+║    POST /dashboards/:id/edit     - Submit edit                    ║
+║    POST /dashboards/:id/refresh  - Refresh dashboard              ║
+║    GET  /dashboards/:id/errors   - Get tile errors                ║
+║                                                                   ║
+║  Extension:                                                       ║
+║    GET  /poll                    - Long-poll for commands         ║
+║    POST /result                  - Report result                  ║
+║    GET  /status                  - Health check                   ║
+╚═══════════════════════════════════════════════════════════════════╝
 `);
 });

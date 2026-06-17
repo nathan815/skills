@@ -121,6 +121,38 @@
       return { success: true, pageId: targetPage.id, pageName: targetPage.name };
     },
 
+    refresh: function() {
+      // Click the command bar refresh button
+      const refreshBtn = document.querySelector('button[aria-label="Refresh"].ms-Button--commandBar');
+      if (!refreshBtn) {
+        return { error: 'Refresh button not found' };
+      }
+      refreshBtn.click();
+      return { success: true, message: 'Dashboard refresh triggered' };
+    },
+
+    getErrors: function() {
+      // Find tile error containers and extract error info with tile IDs
+      const errors = [];
+      const errorContainers = document.querySelectorAll('[class*="bucketErrorContainer"]');
+      
+      errorContainers.forEach(el => {
+        // Walk up to find element with data-tile-id
+        let parent = el;
+        while (parent && !parent.dataset.tileId) {
+          parent = parent.parentElement;
+        }
+        
+        const errorLabel = el.querySelector('[class*="bucketErrorLabel"]');
+        errors.push({
+          tileId: parent?.dataset?.tileId || null,
+          errorText: errorLabel?.textContent || 'An error occurred'
+        });
+      });
+
+      return { errors };
+    },
+
     replaceDashboard: function(dashboardJson, options = {}) {
       return new Promise((resolve, reject) => {
         const skipConfirmation = options.skipConfirmation || false;
@@ -280,6 +312,12 @@
           break;
         case 'selectPage':
           result = window.__adxAgent.selectPage(action.params.pageIdOrName);
+          break;
+        case 'refresh':
+          result = window.__adxAgent.refresh();
+          break;
+        case 'getErrors':
+          result = window.__adxAgent.getErrors();
           break;
         default:
           result = { error: `Unknown action type: ${action.type}` };
