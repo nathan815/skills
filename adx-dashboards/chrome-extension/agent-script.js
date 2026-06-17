@@ -182,8 +182,14 @@
       return;
     }
 
+    // Create abort controller for this poll
+    pollAbortController = new AbortController();
+
     try {
-      const response = await fetch(`http://localhost:${AGENT_SERVER_PORT}/poll?dashboardId=${dashboardId}`);
+      const response = await fetch(
+        `http://localhost:${AGENT_SERVER_PORT}/poll?dashboardId=${dashboardId}`,
+        { signal: pollAbortController.signal }
+      );
       polling = false;
       
       if (!response.ok) {
@@ -209,6 +215,8 @@
       pollAgentServer();
     } catch (e) {
       polling = false;
+      // Ignore abort errors (expected during navigation)
+      if (e.name === 'AbortError') return;
       // Server not available, retry after delay
       setTimeout(pollAgentServer, 2000);
     }
@@ -358,19 +366,79 @@
     }
   }
 
-  async function disconnectFromServer() {
-    const dashboardId = getCurrentDashboardId();
-    if (!dashboardId) return;
+  function disconnectFromServer() {
+    if (!currentDashboardId) return;
 
     // Use sendBeacon for reliable delivery during page unload
     navigator.sendBeacon(
       `http://localhost:${AGENT_SERVER_PORT}/disconnect`,
-      JSON.stringify({ dashboardId })
+      JSON.stringify({ dashboardId: currentDashboardId })
     );
   }
 
   // Disconnect when page unloads
   window.addEventListener('beforeunload', disconnectFromServer);
+
+  // Track current dashboard for SPA navigation
+  let currentDashboardId = null;
+  let pollAbortController = null;
+
+  async function handleDashboardChange() {
+    const newDashboardId = getCurrentDashboardId();
+    
+    // No change
+    if (newDashboardId === currentDashboardId) return;
+    
+    // Disconnect from old dashboard
+    if (currentDashboardId) {
+      navigator.sendBeacon(
+        `http://localhost:${AGENT_SERVER_PORT}/disconnect`,
+        JSON.stringify({ dashboardId: currentDashboardId })
+      );
+      // Abort any pending poll
+      if (pollAbortController) {
+        pollAbortController.abort();
+        pollAbortController = null;
+      }
+    }
+    
+    currentDashboardId = newDashboardId;
+    
+    // Connect to new dashboard (if on a dashboard page)
+    if (newDashboardId) {
+      // Wait for dashboard data to load
+      const waitForData = async () => {
+        const dashData = window.__adxAgent.getDashboard();
+        if (dashData.error || !dashData.title) {
+          setTimeout(waitForData, 500);
+          return;
+        }
+        const connected = await connectToServer();
+        if (connected) {
+          pollAgentServer();
+        } else {
+          setTimeout(waitForData, 500);
+        }
+      };
+      waitForData();
+    }
+  }
+
+  // Detect SPA navigation via history API
+  const originalPushState = history.pushState;
+  const originalReplaceState = history.replaceState;
+  
+  history.pushState = function(...args) {
+    originalPushState.apply(this, args);
+    handleDashboardChange();
+  };
+  
+  history.replaceState = function(...args) {
+    originalReplaceState.apply(this, args);
+    handleDashboardChange();
+  };
+  
+  window.addEventListener('popstate', handleDashboardChange);
 
   // Start: connect then poll
   async function start() {
@@ -379,6 +447,8 @@
       setTimeout(start, 500);
       return;
     }
+    
+    currentDashboardId = dashboardId;
     
     const connected = await connectToServer();
     if (!connected) {
