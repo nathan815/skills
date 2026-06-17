@@ -131,12 +131,12 @@
       return { success: true, message: 'Dashboard refresh triggered' };
     },
 
-    getErrors: function() {
-      // Find tile error containers and extract error info with tile IDs
+    getErrors: async function() {
+      // Find tile error containers and extract full error details
       const errors = [];
       const errorContainers = document.querySelectorAll('[class*="bucketErrorContainer"]');
       
-      errorContainers.forEach(el => {
+      for (const el of errorContainers) {
         // Walk up to find element with data-tile-id
         let parent = el;
         while (parent && !parent.dataset.tileId) {
@@ -144,11 +144,37 @@
         }
         
         const errorLabel = el.querySelector('[class*="bucketErrorLabel"]');
+        const basicError = errorLabel?.textContent || 'An error occurred';
+        
+        // Try to get full error details by clicking Details button
+        let fullError = basicError;
+        const detailsBtn = el.querySelector('button');
+        if (detailsBtn && detailsBtn.textContent.includes('Details')) {
+          detailsBtn.click();
+          
+          // Wait for popover to appear
+          await new Promise(r => setTimeout(r, 100));
+          
+          const popoverBody = document.querySelector('[class*="popoverBody"]');
+          if (popoverBody) {
+            fullError = popoverBody.textContent.trim();
+          }
+          
+          // Dismiss the popup
+          const dismissBtn = document.querySelector('button[aria-label="Dismiss"]') 
+            || [...document.querySelectorAll('button')].find(b => b.textContent === 'Dismiss');
+          if (dismissBtn) {
+            dismissBtn.click();
+            await new Promise(r => setTimeout(r, 50));
+          }
+        }
+        
         errors.push({
           tileId: parent?.dataset?.tileId || null,
-          errorText: errorLabel?.textContent || 'An error occurred'
+          errorType: basicError,
+          errorDetails: fullError
         });
-      });
+      }
 
       return { errors };
     },
@@ -317,7 +343,7 @@
           result = window.__adxAgent.refresh();
           break;
         case 'getErrors':
-          result = window.__adxAgent.getErrors();
+          result = await window.__adxAgent.getErrors();
           break;
         default:
           result = { error: `Unknown action type: ${action.type}` };

@@ -207,29 +207,6 @@ The agent can then re-fetch the dashboard, fix the issue (e.g., correct column n
 - **Dashboard-scoped**: Authorization is per-dashboard and expires on page refresh
 - **Local only**: Server listens on localhost:9876, no external access
 
-### Extension API (Console)
-
-On any ADX dashboard page, `window.__adxAgent` is available:
-
-```javascript
-// Get current dashboard
-const { dashboard, title } = __adxAgent.getDashboard();
-
-// Modify and apply
-dashboard.tiles[0].title = '🤖 Modified!';
-await __adxAgent.replaceDashboard(dashboard, { skipConfirmation: true });
-
-// Navigate pages
-const pages = __adxAgent.getPages();  // {pages: [...], selectedPageId: "..."}
-await __adxAgent.selectPage("page-id");
-
-// Refresh dashboard
-__adxAgent.refresh();
-
-// Check for errors
-const errors = __adxAgent.getErrors();  // [{tileId, message}, ...]
-```
-
 ## Notes
 
 - The Dashboard API is unofficial but functional (used internally by the ADX portal)
