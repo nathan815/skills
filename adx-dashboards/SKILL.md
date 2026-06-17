@@ -110,50 +110,96 @@ or
 
 ## Agentic Live Editing (Browser-Based)
 
-For real-time dashboard editing with visual preview, use the Chrome extension + agent server:
+For real-time dashboard editing with visual preview, use the Chrome extension + agent server. This enables agents to view, edit, navigate, refresh, and monitor tile errors on dashboards the user has open in their browser.
 
 ### Setup
 
 1. **Install the Chrome extension:**
-   ```
-   1. Open edge://extensions (or chrome://extensions)
-   2. Enable Developer mode
-   3. Click "Load unpacked" → select chrome-extension folder
-   ```
+   - Open `edge://extensions` (or `chrome://extensions`)
+   - Enable Developer mode
+   - Click "Load unpacked" → select `chrome-extension` folder
 
 2. **Start the agent server** (zero dependencies, just Node.js):
    ```bash
    node chrome-extension/agent-server.js
    ```
 
-3. **Open the target dashboard** in the browser
+3. **Open the target dashboard** in the browser — it will automatically connect to the agent server
 
-### Agent Edit Flow
+### REST API (localhost:9876)
 
-The agent can now POST edits that get applied in the browser:
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/dashboards` | GET | List all connected dashboards |
+| `/dashboards/:id` | GET | Get dashboard JSON |
+| `/dashboards/:id/pages` | GET | List pages/tabs in dashboard |
+| `/dashboards/:id/selectPage` | POST | Navigate to a page (body: `{"pageId": "..."}`) |
+| `/dashboards/:id/edit` | POST | Apply dashboard edit |
+| `/dashboards/:id/refresh` | POST | Refresh dashboard data |
+| `/dashboards/:id/errors` | GET | Get tile errors for debugging |
+
+### Workflow: Agent Edits a Dashboard
+
+1. **List connected dashboards:**
+   ```bash
+   curl http://localhost:9876/dashboards
+   # Returns: [{"id": "abc123", "title": "My Dashboard"}, ...]
+   ```
+
+2. **Get current dashboard JSON:**
+   ```bash
+   curl http://localhost:9876/dashboards/abc123
+   # Returns full dashboard JSON with all tiles, queries, pages
+   ```
+
+3. **Make your edits to the JSON**, then submit:
+   ```bash
+   curl -X POST http://localhost:9876/dashboards/abc123/edit \
+     -H "Content-Type: application/json" \
+     -d '{
+       "dashboard": { ... modified dashboard JSON ... },
+       "description": "Updated tile title",
+       "skipConfirmation": true
+     }'
+   ```
+
+4. **Refresh to see changes immediately:**
+   ```bash
+   curl -X POST http://localhost:9876/dashboards/abc123/refresh
+   ```
+
+5. **Check for tile errors** (if a tile shows errors after edit):
+   ```bash
+   curl http://localhost:9876/dashboards/abc123/errors
+   # Returns: {"errors": [{"tileId": "tile-uuid", "message": "..."}]}
+   ```
+
+### Navigating Pages/Tabs
+
+Dashboards can have multiple pages. To switch:
 
 ```bash
-# Submit an edit request
-curl -X POST http://localhost:9876/edit \
+# List available pages
+curl http://localhost:9876/dashboards/abc123/pages
+# Returns: {"pages": [{"id": "page1", "name": "Overview"}, {"id": "page2", "name": "Details"}], "selectedPageId": "page1"}
+
+# Navigate to a different page
+curl -X POST http://localhost:9876/dashboards/abc123/selectPage \
   -H "Content-Type: application/json" \
-  -d '{
-    "dashboardId": "f8537cec-8b2e-45c1-b96b-046960ead1ce",
-    "dashboard": { ... modified dashboard JSON ... },
-    "description": "Updated tile title",
-    "skipConfirmation": true
-  }'
+  -d '{"pageId": "page2"}'
 ```
 
-The request blocks until the extension applies the edit and returns:
-```json
-{"success": true, "message": "Dashboard replaced (auto-confirmed)"}
+### Self-Correction with Errors API
+
+If an edit causes tile errors, the agent can detect and fix them:
+
+```bash
+# After an edit, check for errors
+curl http://localhost:9876/dashboards/abc123/errors
+# Returns: {"errors": [{"tileId": "abc", "message": "Query failed: column 'foo' not found"}]}
 ```
 
-If validation fails, the error details are returned:
-```json
-{"success": false, "error": "Error found at: /tiles/0/visualOptions/xColumn..."}
-```
-```
+The agent can then re-fetch the dashboard, fix the issue (e.g., correct column name), and re-submit the edit.
 
 ### Security
 
@@ -172,6 +218,16 @@ const { dashboard, title } = __adxAgent.getDashboard();
 // Modify and apply
 dashboard.tiles[0].title = '🤖 Modified!';
 await __adxAgent.replaceDashboard(dashboard, { skipConfirmation: true });
+
+// Navigate pages
+const pages = __adxAgent.getPages();  // {pages: [...], selectedPageId: "..."}
+await __adxAgent.selectPage("page-id");
+
+// Refresh dashboard
+__adxAgent.refresh();
+
+// Check for errors
+const errors = __adxAgent.getErrors();  // [{tileId, message}, ...]
 ```
 
 ## Notes
