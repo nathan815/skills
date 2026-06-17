@@ -81,8 +81,44 @@
       return {
         dashboard: JSON.parse(JSON.stringify(rtd.state.state.hostState.dashboard)),
         title: rtd.state.state.hostState.title,
-        meta: rtd.state.state.hostState.meta
+        meta: rtd.state.state.hostState.meta,
+        selectedPageId: rtd.state.state.hostState.selectedPageId || null
       };
+    },
+
+    getPages: function() {
+      const rtd = window.__rtd;
+      if (!rtd?.state?.state?.hostState?.dashboard?.pages) {
+        return { error: 'Dashboard not loaded' };
+      }
+      const pages = rtd.state.state.hostState.dashboard.pages;
+      const selectedPageId = rtd.state.state.hostState.selectedPageId;
+      return {
+        pages: pages.map(p => ({ id: p.id, name: p.name })),
+        selectedPageId
+      };
+    },
+
+    selectPage: function(pageIdOrName) {
+      // Find the tab element by page ID or name and click it
+      const pages = window.__rtd?.state?.state?.hostState?.dashboard?.pages || [];
+      
+      // Resolve pageIdOrName to actual page
+      let targetPage = pages.find(p => p.id === pageIdOrName || p.name === pageIdOrName);
+      if (!targetPage) {
+        return { error: `Page not found: ${pageIdOrName}` };
+      }
+
+      // Find the menuitemradio with matching page name
+      const tabElement = Array.from(document.querySelectorAll('[role="menuitemradio"]'))
+        .find(el => el.textContent.trim() === targetPage.name);
+      
+      if (!tabElement) {
+        return { error: `Tab element not found for page: ${targetPage.name}` };
+      }
+
+      tabElement.click();
+      return { success: true, pageId: targetPage.id, pageName: targetPage.name };
     },
 
     replaceDashboard: function(dashboardJson, options = {}) {
@@ -205,6 +241,12 @@
         await handlePendingGet(data.pendingGet);
       }
       
+      // Handle actions (getPages, selectPage, etc.)
+      if (data.pendingAction && !handledEditIds.has(data.pendingAction.id)) {
+        handledEditIds.add(data.pendingAction.id);
+        await handlePendingAction(data.pendingAction);
+      }
+      
       // Handle edit requests
       if (data.pendingEdit && !handledEditIds.has(data.pendingEdit.id)) {
         handledEditIds.add(data.pendingEdit.id);
@@ -225,6 +267,28 @@
   async function handlePendingGet(getReq) {
     const result = window.__adxAgent.getDashboard();
     await sendGetResult(getReq.id, result);
+  }
+
+  async function handlePendingAction(action) {
+    const actionId = action.id;
+    let result;
+
+    try {
+      switch (action.type) {
+        case 'getPages':
+          result = window.__adxAgent.getPages();
+          break;
+        case 'selectPage':
+          result = window.__adxAgent.selectPage(action.params.pageIdOrName);
+          break;
+        default:
+          result = { error: `Unknown action type: ${action.type}` };
+      }
+    } catch (e) {
+      result = { error: e.message };
+    }
+
+    await sendActionResult(actionId, result);
   }
 
   async function handlePendingEdit(edit) {
@@ -341,6 +405,18 @@
       });
     } catch (e) {
       console.error('[ADX Agent] Failed to send get result:', e);
+    }
+  }
+
+  async function sendActionResult(actionId, result) {
+    try {
+      await fetch(`http://localhost:${AGENT_SERVER_PORT}/result`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actionId, result })
+      });
+    } catch (e) {
+      console.error('[ADX Agent] Failed to send action result:', e);
     }
   }
 

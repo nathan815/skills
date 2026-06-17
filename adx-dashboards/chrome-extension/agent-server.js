@@ -22,11 +22,13 @@ const { randomUUID } = require('crypto');
 const PORT = parseInt(process.argv.find((_, i, a) => a[i-1] === '--port') || '9876');
 const EDIT_TIMEOUT_MS = 120000;
 const GET_TIMEOUT_MS = 10000;
+const ACTION_TIMEOUT_MS = 10000;
 const POLL_TIMEOUT_MS = 30000;
 
 // In-memory stores
 const pendingEdits = new Map();
 const pendingGets = new Map();
+const pendingActions = new Map();  // Generic actions (getPages, selectPage, etc.)
 const waitingPollers = [];  // Extension's long-poll requests
 const connectedDashboards = new Map();  // id -> {id, title, connectedAt}
 
@@ -53,6 +55,21 @@ function handlePollResponse(res, dashboardId) {
     }
   }
 
+  // Check for pending actions (getPages, selectPage, etc.)
+  for (const [id, action] of pendingActions) {
+    if (!action.result && (action.dashboardId === '*' || action.dashboardId === dashboardId)) {
+      sendJson(res, {
+        pendingAction: {
+          id,
+          dashboardId: action.dashboardId,
+          type: action.type,
+          params: action.params
+        }
+      });
+      return;
+    }
+  }
+
   // Check for pending edits
   for (const [id, edit] of pendingEdits) {
     if (!edit.result && (edit.dashboardId === '*' || edit.dashboardId === dashboardId)) {
@@ -70,7 +87,7 @@ function handlePollResponse(res, dashboardId) {
     }
   }
 
-  sendJson(res, { pendingEdit: null, pendingGet: null });
+  sendJson(res, { pendingEdit: null, pendingGet: null, pendingAction: null });
 }
 
 function sendJson(res, data, status = 200) {
@@ -194,12 +211,14 @@ async function handleDashboardGet(req, res) {
   pendingGets.delete(getId);
 
   if (result.timeout) {
+    log(`Get timeout: ${getId}`);
     return sendJson(res, {
       error: 'Timeout waiting for dashboard data',
       hint: 'Make sure the ADX dashboard is open'
     }, 504);
   }
 
+  log(`Get completed: ${getId}`);
   sendJson(res, result);
 }
 
@@ -233,12 +252,25 @@ async function handlePoll(req, res) {
     }
   }
 
+  for (const [id, action] of pendingActions) {
+    if (!action.result && (action.dashboardId === '*' || action.dashboardId === dashboardId)) {
+      return sendJson(res, {
+        pendingAction: {
+          id,
+          dashboardId: action.dashboardId,
+          type: action.type,
+          params: action.params
+        }
+      });
+    }
+  }
+
   // No pending commands - hold the connection (long poll)
   const timeout = setTimeout(() => {
     // Remove from waiting list
     const idx = waitingPollers.findIndex(p => p.res === res);
     if (idx >= 0) waitingPollers.splice(idx, 1);
-    sendJson(res, { pendingEdit: null, pendingGet: null });
+    sendJson(res, { pendingEdit: null, pendingGet: null, pendingAction: null });
   }, POLL_TIMEOUT_MS);
 
   waitingPollers.push({ res, dashboardId, timeout });
@@ -269,6 +301,15 @@ async function handleResult(req, res) {
     const get = pendingGets.get(getId);
     get.result = result;
     get.resolve(result);
+    return sendJson(res, { ok: true });
+  }
+
+  // Handle action results (getPages, selectPage, etc.)
+  const { actionId } = data;
+  if (actionId && pendingActions.has(actionId)) {
+    const action = pendingActions.get(actionId);
+    action.result = result;
+    action.resolve(result);
     return sendJson(res, { ok: true });
   }
 
@@ -325,6 +366,91 @@ async function handleDashboards(req, res) {
   sendJson(res, { dashboards });
 }
 
+async function handlePages(req, res) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const dashboardId = url.searchParams.get('dashboardId') || '*';
+
+  const actionId = randomUUID();
+  const action = {
+    id: actionId,
+    dashboardId,
+    type: 'getPages',
+    params: {},
+    createdAt: Date.now(),
+    result: null,
+    resolve: null
+  };
+
+  const resultPromise = new Promise((resolve) => {
+    action.resolve = resolve;
+  });
+
+  pendingActions.set(actionId, action);
+  notifyPollers();
+
+  const timeoutPromise = new Promise((resolve) =>
+    setTimeout(() => resolve({ timeout: true }), ACTION_TIMEOUT_MS)
+  );
+
+  const result = await Promise.race([resultPromise, timeoutPromise]);
+  pendingActions.delete(actionId);
+
+  if (result.timeout) {
+    return sendJson(res, { error: 'Timeout waiting for pages' }, 504);
+  }
+
+  sendJson(res, result);
+}
+
+async function handleSelectPage(req, res) {
+  let data;
+  try {
+    data = await parseBody(req);
+  } catch (e) {
+    return sendJson(res, { error: 'Invalid JSON' }, 400);
+  }
+
+  const { dashboardId, pageId, pageName } = data;
+  const targetDashboard = dashboardId || '*';
+  const pageIdOrName = pageId || pageName;
+
+  if (!pageIdOrName) {
+    return sendJson(res, { error: 'Missing pageId or pageName' }, 400);
+  }
+
+  const actionId = randomUUID();
+  const action = {
+    id: actionId,
+    dashboardId: targetDashboard,
+    type: 'selectPage',
+    params: { pageIdOrName },
+    createdAt: Date.now(),
+    result: null,
+    resolve: null
+  };
+
+  const resultPromise = new Promise((resolve) => {
+    action.resolve = resolve;
+  });
+
+  pendingActions.set(actionId, action);
+  log(`Select page: ${pageIdOrName} on dashboard ${targetDashboard}`);
+  notifyPollers();
+
+  const timeoutPromise = new Promise((resolve) =>
+    setTimeout(() => resolve({ timeout: true }), ACTION_TIMEOUT_MS)
+  );
+
+  const result = await Promise.race([resultPromise, timeoutPromise]);
+  pendingActions.delete(actionId);
+
+  if (result.timeout) {
+    return sendJson(res, { error: 'Timeout waiting for page selection' }, 504);
+  }
+
+  sendJson(res, result);
+}
+
 function handleCors(req, res) {
   res.writeHead(204, {
     'Access-Control-Allow-Origin': '*',
@@ -353,6 +479,10 @@ const server = http.createServer(async (req, res) => {
       await handleDashboardGet(req, res);
     } else if (path === '/dashboards' && req.method === 'GET') {
       await handleDashboards(req, res);
+    } else if (path === '/pages' && req.method === 'GET') {
+      await handlePages(req, res);
+    } else if (path === '/selectPage' && req.method === 'POST') {
+      await handleSelectPage(req, res);
     } else if (path === '/connect' && req.method === 'POST') {
       await handleConnect(req, res);
     } else if (path === '/disconnect' && req.method === 'POST') {
