@@ -122,7 +122,7 @@ async function handleStatus(req, res) {
   });
 }
 
-async function handleEdit(req, res) {
+async function handleEdit(req, res, dashboardIdFromPath) {
   let data;
   try {
     data = await parseBody(req);
@@ -135,7 +135,7 @@ async function handleEdit(req, res) {
   }
 
   const editId = randomUUID();
-  const dashboardId = data.dashboardId || '*';
+  const dashboardId = dashboardIdFromPath || data.dashboardId || '*';
 
   const edit = {
     id: editId,
@@ -180,9 +180,8 @@ async function handleEdit(req, res) {
   sendJson(res, result);
 }
 
-async function handleDashboardGet(req, res) {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  const dashboardId = url.searchParams.get('dashboardId') || '*';
+async function handleDashboardGet(req, res, dashboardIdFromPath) {
+  const dashboardId = dashboardIdFromPath || '*';
 
   const getId = randomUUID();
   const get = {
@@ -366,9 +365,8 @@ async function handleDashboards(req, res) {
   sendJson(res, { dashboards });
 }
 
-async function handlePages(req, res) {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  const dashboardId = url.searchParams.get('dashboardId') || '*';
+async function handlePages(req, res, dashboardIdFromPath) {
+  const dashboardId = dashboardIdFromPath || '*';
 
   const actionId = randomUUID();
   const action = {
@@ -402,7 +400,7 @@ async function handlePages(req, res) {
   sendJson(res, result);
 }
 
-async function handleSelectPage(req, res) {
+async function handleSelectPage(req, res, dashboardIdFromPath) {
   let data;
   try {
     data = await parseBody(req);
@@ -410,8 +408,8 @@ async function handleSelectPage(req, res) {
     return sendJson(res, { error: 'Invalid JSON' }, 400);
   }
 
-  const { dashboardId, pageId, pageName } = data;
-  const targetDashboard = dashboardId || '*';
+  const { pageId, pageName } = data;
+  const dashboardId = dashboardIdFromPath || data.dashboardId || '*';
   const pageIdOrName = pageId || pageName;
 
   if (!pageIdOrName) {
@@ -421,7 +419,7 @@ async function handleSelectPage(req, res) {
   const actionId = randomUUID();
   const action = {
     id: actionId,
-    dashboardId: targetDashboard,
+    dashboardId,
     type: 'selectPage',
     params: { pageIdOrName },
     createdAt: Date.now(),
@@ -470,19 +468,33 @@ const server = http.createServer(async (req, res) => {
     return handleCors(req, res);
   }
 
+  // Parse RESTful dashboard routes: /dashboards/:id/...
+  const dashboardMatch = path.match(/^\/dashboards\/([^/]+)(\/(.+))?$/);
+
   try {
     if (path === '/status' && req.method === 'GET') {
       await handleStatus(req, res);
-    } else if (path === '/edit' && req.method === 'POST') {
-      await handleEdit(req, res);
-    } else if (path === '/dashboard' && req.method === 'GET') {
-      await handleDashboardGet(req, res);
     } else if (path === '/dashboards' && req.method === 'GET') {
       await handleDashboards(req, res);
-    } else if (path === '/pages' && req.method === 'GET') {
-      await handlePages(req, res);
-    } else if (path === '/selectPage' && req.method === 'POST') {
-      await handleSelectPage(req, res);
+    } else if (dashboardMatch) {
+      const dashboardId = dashboardMatch[1];
+      const subPath = dashboardMatch[3] || '';
+      
+      if (!subPath && req.method === 'GET') {
+        // GET /dashboards/:id - get dashboard JSON
+        await handleDashboardGet(req, res, dashboardId);
+      } else if (subPath === 'pages' && req.method === 'GET') {
+        // GET /dashboards/:id/pages
+        await handlePages(req, res, dashboardId);
+      } else if (subPath === 'selectPage' && req.method === 'POST') {
+        // POST /dashboards/:id/selectPage
+        await handleSelectPage(req, res, dashboardId);
+      } else if (subPath === 'edit' && req.method === 'POST') {
+        // POST /dashboards/:id/edit
+        await handleEdit(req, res, dashboardId);
+      } else {
+        sendJson(res, { error: 'Not found' }, 404);
+      }
     } else if (path === '/connect' && req.method === 'POST') {
       await handleConnect(req, res);
     } else if (path === '/disconnect' && req.method === 'POST') {
@@ -503,7 +515,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`
 ╔═══════════════════════════════════════════════════════════╗
-║       ADX Dashboard Agent Server v2.0.0 (Node.js)         ║
+║       ADX Dashboard Agent Server v2.1.0 (Node.js)         ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  Listening on: http://localhost:${PORT.toString().padEnd(24)}║
 ║                                                           ║
