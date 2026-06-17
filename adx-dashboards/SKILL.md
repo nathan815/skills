@@ -108,8 +108,69 @@ or
 {"valid": false, "errors": ["Error message 1", "Error message 2"]}
 ```
 
+## Agentic Live Editing (Browser-Based)
+
+For real-time dashboard editing with visual preview, use the Chrome extension + agent server:
+
+### Setup
+
+1. **Install the Chrome extension:**
+   ```
+   1. Open edge://extensions (or chrome://extensions)
+   2. Enable Developer mode
+   3. Click "Load unpacked" → select chrome-extension folder
+   ```
+
+2. **Start the agent server:**
+   ```bash
+   uv run python chrome-extension/agent_server.py
+   ```
+
+3. **Open the target dashboard** in the browser
+
+### Agent Edit Flow
+
+The agent can now POST edits that get applied in the browser:
+
+```bash
+# Submit an edit request
+curl -X POST http://localhost:9876/edit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dashboardId": "f8537cec-8b2e-45c1-b96b-046960ead1ce",
+    "dashboard": { ... modified dashboard JSON ... },
+    "description": "Updated tile title",
+    "skipConfirmation": true
+  }'
+```
+
+The request blocks until the extension applies the edit and returns:
+```json
+{"success": true, "message": "Dashboard replaced (auto-confirmed)"}
+```
+
+### Security
+
+- **First-time authorization**: User must click "Allow Edits" when an agent first tries to edit a dashboard
+- **Dashboard-scoped**: Authorization is per-dashboard and expires on page refresh
+- **Local only**: Server listens on localhost:9876, no external access
+
+### Extension API (Console)
+
+On any ADX dashboard page, `window.__adxAgent` is available:
+
+```javascript
+// Get current dashboard
+const { dashboard, title } = __adxAgent.getDashboard();
+
+// Modify and apply
+dashboard.tiles[0].title = '🤖 Modified!';
+await __adxAgent.replaceDashboard(dashboard, { skipConfirmation: true });
+```
+
 ## Notes
 
 - The Dashboard API is unofficial but functional (used internally by the ADX portal)
 - eTag is required for updates - the script handles this automatically
 - Schema version may change over time (currently v55)
+- Browser-based editing requires schema_version 75 (integer), API uses 55 (string)
