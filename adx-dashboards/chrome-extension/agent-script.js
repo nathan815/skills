@@ -51,6 +51,24 @@
     return errors.length > 0 ? errors.join('\n\n') : null;
   }
 
+  function closeValidationErrorDialog() {
+    // Find and click the Close button on validation error dialogs
+    const closeBtn = Array.from(document.querySelectorAll('button')).find(b => 
+      b.textContent.trim() === 'Close' || b.textContent.includes('Close')
+    );
+    if (closeBtn) {
+      closeBtn.click();
+    }
+    
+    // Also try clicking any dialog dismiss button
+    const dismissBtn = document.querySelector('[data-testid="dismiss-button"]') ||
+                       document.querySelector('.ms-Panel-closeButton') ||
+                       document.querySelector('[aria-label="Close"]');
+    if (dismissBtn) {
+      dismissBtn.click();
+    }
+  }
+
   window.__adxAgent = {
     version: '1.0.0',
     authorizedDashboards,
@@ -133,6 +151,9 @@
 
     _clickFileReplace: function() {
       return new Promise((resolve, reject) => {
+        // Close any existing error dialog first
+        closeValidationErrorDialog();
+        
         const fileMenu = Array.from(document.querySelectorAll('[role="menuitem"]'))
           .find(el => el.textContent.includes('File'));
         if (!fileMenu) { reject(new Error('File menu not found')); return; }
