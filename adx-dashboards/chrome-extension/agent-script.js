@@ -2,10 +2,10 @@
   'use strict';
 
   const AGENT_SERVER_PORT = 9876;
-  const POLL_INTERVAL_MS = 1000;
   const authorizedDashboards = new Set();
   const handledEditIds = new Set();
   let dialogOpen = false;
+  let polling = false;
 
   function getCurrentDashboardId() {
     const match = window.location.pathname.match(/\/dashboards\/([a-f0-9-]+)/i);
@@ -170,16 +170,26 @@
     }
   };
 
-  // Polling for agent commands
+  // Long polling for agent commands
   async function pollAgentServer() {
-    if (dialogOpen) return;
+    if (polling) return;  // Prevent concurrent polls
+    polling = true;
     
     const dashboardId = getCurrentDashboardId();
-    if (!dashboardId) return;
+    if (!dashboardId) {
+      polling = false;
+      setTimeout(pollAgentServer, 1000);  // Retry when dashboard loads
+      return;
+    }
 
     try {
       const response = await fetch(`http://localhost:${AGENT_SERVER_PORT}/poll?dashboardId=${dashboardId}`);
-      if (!response.ok) return;
+      polling = false;
+      
+      if (!response.ok) {
+        setTimeout(pollAgentServer, 1000);
+        return;
+      }
 
       const data = await response.json();
       
@@ -194,8 +204,13 @@
         handledEditIds.add(data.pendingEdit.id);
         await handlePendingEdit(data.pendingEdit);
       }
+      
+      // Immediately poll again (long polling returns quickly when there's a command)
+      pollAgentServer();
     } catch (e) {
-      // Server not available
+      polling = false;
+      // Server not available, retry after delay
+      setTimeout(pollAgentServer, 2000);
     }
   }
 
@@ -321,11 +336,61 @@
     }
   }
 
-  // Start polling
-  if (getCurrentDashboardId()) {
-    setInterval(pollAgentServer, POLL_INTERVAL_MS);
+  async function connectToServer() {
+    const dashboardId = getCurrentDashboardId();
+    if (!dashboardId) return false;
+
+    const dashData = window.__adxAgent.getDashboard();
+    // Wait for dashboard to actually load (not just URL match)
+    if (dashData.error || !dashData.title) {
+      return false;  // Will retry in start()
+    }
+
+    try {
+      await fetch(`http://localhost:${AGENT_SERVER_PORT}/connect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dashboardId, title: dashData.title })
+      });
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function disconnectFromServer() {
+    const dashboardId = getCurrentDashboardId();
+    if (!dashboardId) return;
+
+    // Use sendBeacon for reliable delivery during page unload
+    navigator.sendBeacon(
+      `http://localhost:${AGENT_SERVER_PORT}/disconnect`,
+      JSON.stringify({ dashboardId })
+    );
+  }
+
+  // Disconnect when page unloads
+  window.addEventListener('beforeunload', disconnectFromServer);
+
+  // Start: connect then poll
+  async function start() {
+    const dashboardId = getCurrentDashboardId();
+    if (!dashboardId) {
+      setTimeout(start, 500);
+      return;
+    }
+    
+    const connected = await connectToServer();
+    if (!connected) {
+      // Dashboard data not ready yet, retry
+      setTimeout(start, 500);
+      return;
+    }
+    
     pollAgentServer();
   }
+
+  start();
 
   console.log('[ADX Agent] Main world loaded. window.__adxAgent ready.');
 })();

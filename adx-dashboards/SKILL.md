@@ -121,9 +121,9 @@ For real-time dashboard editing with visual preview, use the Chrome extension + 
    3. Click "Load unpacked" → select chrome-extension folder
    ```
 
-2. **Start the agent server:**
+2. **Start the agent server** (zero dependencies, just Node.js):
    ```bash
-   uv run python chrome-extension/agent_server.py
+   node chrome-extension/agent-server.js
    ```
 
 3. **Open the target dashboard** in the browser
@@ -147,6 +147,12 @@ curl -X POST http://localhost:9876/edit \
 The request blocks until the extension applies the edit and returns:
 ```json
 {"success": true, "message": "Dashboard replaced (auto-confirmed)"}
+```
+
+If validation fails, the error details are returned:
+```json
+{"success": false, "error": "Error found at: /tiles/0/visualOptions/xColumn..."}
+```
 ```
 
 ### Security
