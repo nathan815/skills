@@ -12,6 +12,45 @@
     return match ? match[1] : null;
   }
 
+  function extractValidationErrors() {
+    // Look for validation error dialog/container
+    // ADX shows "Failed to validate your dashboard file" with error details
+    const errorHeader = Array.from(document.querySelectorAll('*')).find(el => 
+      el.textContent.includes('Failed to validate') && el.textContent.length < 200
+    );
+    
+    if (!errorHeader) return null;
+
+    // Find the error container (usually a modal or panel)
+    let container = errorHeader.closest('[role="dialog"]') || 
+                    errorHeader.closest('.ms-Panel') ||
+                    errorHeader.parentElement?.parentElement;
+    
+    if (!container) return null;
+
+    // Extract all error messages
+    const errors = [];
+    const errorBlocks = container.querySelectorAll('[class*="error"], [class*="Error"], pre, code');
+    
+    // Also look for "Error found at:" patterns in text
+    const allText = container.innerText;
+    const errorMatches = allText.match(/Error found at:[\s\S]*?Message:[\s\S]*?(?=Error found at:|$)/g);
+    
+    if (errorMatches) {
+      errors.push(...errorMatches.map(e => e.trim()));
+    }
+
+    if (errors.length === 0) {
+      // Fallback: grab all text from the error container
+      const fullText = container.innerText.trim();
+      if (fullText.includes('Failed to validate')) {
+        return fullText.substring(0, 2000); // Limit length
+      }
+    }
+
+    return errors.length > 0 ? errors.join('\n\n') : null;
+  }
+
   window.__adxAgent = {
     version: '1.0.0',
     authorizedDashboards,
@@ -59,7 +98,15 @@
               this.dispatchEvent(new Event('change', { bubbles: true }));
               HTMLInputElement.prototype.click = originalClick;
 
+              // Wait for validation, then check for errors or success
               setTimeout(() => {
+                // Check for validation error dialog
+                const errorText = extractValidationErrors();
+                if (errorText) {
+                  reject(new Error(errorText));
+                  return;
+                }
+
                 if (skipConfirmation) {
                   const continueBtn = document.querySelector('[data-testid="confirm-button"]') ||
                     Array.from(document.querySelectorAll('button')).find(b => b.textContent === 'Continue');
@@ -72,7 +119,7 @@
                 } else {
                   resolve({ success: true, message: 'Dashboard injected, waiting for confirmation' });
                 }
-              }, 500);
+              }, 800);
             }, 50);
 
             return;
