@@ -109,8 +109,10 @@ async function ensureDaemon() {
   });
   child.unref();
 
-  // Wait for the freshly spawned daemon to report healthy.
-  const deadline = Date.now() + 8000;
+  // Cold daemon start can be slow on the first run (Windows process spawn +
+  // ajv lazy-load), so give it a generous window before declaring failure.
+  // Still far below the request timeout, so this never masks a real hang.
+  const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
     await sleep(150);
     if (await isDaemonUp()) return;
@@ -237,7 +239,20 @@ async function cmdEdit(id, flags) {
       filename: path.basename(file),
     }),
   });
-  const body = expectOk(res, 'Edit');
+  const body = res.body;
+  // The extension reports "user must approve" as a distinct, recoverable state.
+  // Surface it as its own signal (not a generic failure) so the agent knows to
+  // ask the user to click "Allow Edits" and then simply re-run the same edit,
+  // rather than improvising an alternate write path.
+  if (body && body.pendingAuthorization) {
+    emit({
+      ok: false,
+      pendingAuthorization: true,
+      error: body.error || 'Authorization required in the ADX browser tab.',
+      hint: "Tell the user to click 'Allow Edits' in the ADX dashboard tab, then re-run this exact edit command.",
+    }, 2);
+  }
+  expectOk(res, 'Edit');
   emit({ ok: true, ...body });
 }
 

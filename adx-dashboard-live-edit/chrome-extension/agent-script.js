@@ -3,13 +3,60 @@
 
   const AGENT_SERVER_PORT = 9876;
   const authorizedDashboards = new Set();
+  const pendingAuthDashboards = new Set();
   const handledEditIds = new Set();
-  let dialogOpen = false;
   let polling = false;
+
+  // Persisted authorization survives page reloads so the user is not re-prompted
+  // on every refresh. It is time-boxed: a grant expires after this window and the
+  // overlay appears again, keeping the localhost consent gate meaningful.
+  const AUTH_STORAGE_PREFIX = 'adxAgentAuth:';
+  const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
 
   function getCurrentDashboardId() {
     const match = window.location.pathname.match(/\/dashboards\/([a-f0-9-]+)/i);
     return match ? match[1] : null;
+  }
+
+  function isAuthorized(dashboardId) {
+    if (authorizedDashboards.has(dashboardId)) return true;
+    // Fall back to a persisted grant so a reload does not force a re-prompt.
+    try {
+      const raw = localStorage.getItem(AUTH_STORAGE_PREFIX + dashboardId);
+      if (!raw) return false;
+      const rec = JSON.parse(raw);
+      if (rec && rec.expiresAt && Date.now() < rec.expiresAt) {
+        authorizedDashboards.add(dashboardId);
+        return true;
+      }
+      // Expired: drop it so the next edit prompts cleanly.
+      localStorage.removeItem(AUTH_STORAGE_PREFIX + dashboardId);
+    } catch (e) {
+      // localStorage can be unavailable in locked-down contexts; treat as unauthorized.
+    }
+    return false;
+  }
+
+  function persistAuthorization(dashboardId) {
+    authorizedDashboards.add(dashboardId);
+    try {
+      localStorage.setItem(AUTH_STORAGE_PREFIX + dashboardId, JSON.stringify({
+        dashboardId,
+        allowedAt: Date.now(),
+        expiresAt: Date.now() + AUTH_TTL_MS
+      }));
+    } catch (e) {
+      // Non-fatal: the in-memory grant still covers this page session.
+    }
+  }
+
+  function clearAuthorization(dashboardId) {
+    authorizedDashboards.delete(dashboardId);
+    try {
+      localStorage.removeItem(AUTH_STORAGE_PREFIX + dashboardId);
+    } catch (e) {
+      // Nothing to clean up if storage is unavailable.
+    }
   }
 
   function extractValidationErrors() {
@@ -430,32 +477,50 @@
     const dashboardId = getCurrentDashboardId();
     const editId = edit.id;
 
-    if (!authorizedDashboards.has(dashboardId)) {
-      dialogOpen = true;
-      const confirmed = await showAuthorizationDialog(dashboardId, edit);
-      dialogOpen = false;
-      if (!confirmed) {
-        await sendEditResult(editId, { success: false, error: 'User declined authorization' });
-        return;
-      }
-      authorizedDashboards.add(dashboardId);
+    if (!dashboardId) {
+      await sendEditResult(editId, { success: false, error: 'No dashboard is currently open in this tab' });
+      return;
     }
 
+    // Validate the edit can actually apply here BEFORE asking for authorization.
+    // Prompting (and persisting a grant) for a mismatched or expired edit would
+    // bless the wrong dashboard or mutate it after the agent already gave up.
     if (edit.dashboardId && edit.dashboardId !== '*' && edit.dashboardId !== dashboardId) {
-      await sendEditResult(editId, { 
-        success: false, 
-        error: `Dashboard ID mismatch: edit is for ${edit.dashboardId}, current is ${dashboardId}` 
+      await sendEditResult(editId, {
+        success: false,
+        error: `Dashboard ID mismatch: edit is for ${edit.dashboardId}, current is ${dashboardId}`
       });
       return;
     }
 
     // The daemon deletes a pending edit once it times out and returns a failure
-    // to the agent. If authorization took longer than that window, applying now
-    // would silently mutate the dashboard after the agent already moved on.
+    // to the agent. If we applied a stale edit now, the dashboard would change
+    // silently after the agent already moved on.
     if (edit.expiresAt && Date.now() > edit.expiresAt) {
       await sendEditResult(editId, {
         success: false,
         error: 'Edit expired before it could be applied (the daemon already timed out). Re-run the edit.'
+      });
+      return;
+    }
+
+    // Authorization is a human consent gate. The overlay used to be awaited here,
+    // which hung the whole edit (and the agent) until the user happened to click,
+    // or until the daemon timed out 120s later. Instead, surface the overlay and
+    // return an actionable result immediately: the user clicks "Allow Edits", then
+    // the agent re-runs the edit, which now passes this check.
+    if (!isAuthorized(dashboardId)) {
+      if (!pendingAuthDashboards.has(dashboardId)) {
+        pendingAuthDashboards.add(dashboardId);
+        showAuthorizationDialog(dashboardId, {
+          onAllow: () => { pendingAuthDashboards.delete(dashboardId); persistAuthorization(dashboardId); },
+          onDeny: () => { pendingAuthDashboards.delete(dashboardId); clearAuthorization(dashboardId); }
+        });
+      }
+      await sendEditResult(editId, {
+        success: false,
+        pendingAuthorization: true,
+        error: "Authorization required: an approval dialog is open in the ADX browser tab. Click 'Allow Edits' to grant this agent permission for this dashboard, then re-run the edit."
       });
       return;
     }
@@ -471,62 +536,61 @@
     }
   }
 
-  async function showAuthorizationDialog(dashboardId, edit) {
-    return new Promise((resolve) => {
-      const overlay = document.createElement('div');
-      overlay.style.cssText = `
-        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-        background: rgba(0,0,0,0.5); z-index: 999999;
-        display: flex; align-items: center; justify-content: center;
-      `;
+  // Non-blocking by design: render the consent overlay and fire onAllow/onDeny
+  // when the user clicks. The edit path no longer awaits this, so a dialog left
+  // unclicked can never hang the agent. The "Allow" handler persists the grant.
+  function showAuthorizationDialog(dashboardId, { onAllow, onDeny } = {}) {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = `
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.5); z-index: 999999;
+      display: flex; align-items: center; justify-content: center;
+    `;
 
-      const dialog = document.createElement('div');
-      dialog.style.cssText = `
-        background: white; padding: 24px; border-radius: 8px;
-        max-width: 500px; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      `;
+    const dialog = document.createElement('div');
+    dialog.style.cssText = `
+      background: white; padding: 24px; border-radius: 8px;
+      max-width: 500px; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    `;
 
-      const currentDashboard = window.__adxAgent.getDashboard();
-      const title = currentDashboard.title || 'Unknown Dashboard';
+    const currentDashboard = window.__adxAgent.getDashboard();
+    const title = currentDashboard.title || 'Unknown Dashboard';
 
-      dialog.innerHTML = `
-        <h2 style="margin: 0 0 16px 0; color: #0078d4;">🤖 Agent Edit Request</h2>
-        <p style="margin: 0 0 12px 0;">An agent wants to edit this dashboard:</p>
-        <p style="margin: 0 0 12px 0; padding: 12px; background: #f3f3f3; border-radius: 4px;">
-          <strong>${title}</strong><br>
-          <code style="font-size: 12px; color: #666;">${dashboardId}</code>
-        </p>
-        <p style="margin: 0 0 16px 0; font-size: 14px; color: #666;">
-          ${edit.description || 'No description provided'}
-        </p>
-        <p style="margin: 0 0 16px 0; font-size: 13px; color: #a4262c;">
-          ⚠️ This will allow the agent to modify this dashboard until you refresh the page.
-        </p>
-        <div style="display: flex; gap: 12px; justify-content: flex-end;">
-          <button id="adx-agent-deny" style="
-            padding: 8px 16px; border: 1px solid #ccc; border-radius: 4px;
-            background: white; cursor: pointer; font-size: 14px;
-          ">Deny</button>
-          <button id="adx-agent-allow" style="
-            padding: 8px 16px; border: none; border-radius: 4px;
-            background: #0078d4; color: white; cursor: pointer; font-size: 14px;
-          ">Allow Edits</button>
-        </div>
-      `;
+    dialog.innerHTML = `
+      <h2 style="margin: 0 0 16px 0; color: #0078d4;">🤖 Agent Edit Request</h2>
+      <p style="margin: 0 0 12px 0;">An agent wants to edit this dashboard:</p>
+      <p style="margin: 0 0 12px 0; padding: 12px; background: #f3f3f3; border-radius: 4px;">
+        <strong>${title}</strong><br>
+        <code style="font-size: 12px; color: #666;">${dashboardId}</code>
+      </p>
+      <p style="margin: 0 0 16px 0; font-size: 13px; color: #a4262c;">
+        ⚠️ Allowing grants this agent permission to modify this dashboard for the
+        next 12 hours (it survives page reloads). Deny to refuse.
+      </p>
+      <div style="display: flex; gap: 12px; justify-content: flex-end;">
+        <button id="adx-agent-deny" style="
+          padding: 8px 16px; border: 1px solid #ccc; border-radius: 4px;
+          background: white; cursor: pointer; font-size: 14px;
+        ">Deny</button>
+        <button id="adx-agent-allow" style="
+          padding: 8px 16px; border: none; border-radius: 4px;
+          background: #0078d4; color: white; cursor: pointer; font-size: 14px;
+        ">Allow Edits</button>
+      </div>
+    `;
 
-      overlay.appendChild(dialog);
-      document.body.appendChild(overlay);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
 
-      dialog.querySelector('#adx-agent-allow').addEventListener('click', () => {
-        document.body.removeChild(overlay);
-        resolve(true);
-      });
+    dialog.querySelector('#adx-agent-allow').addEventListener('click', () => {
+      if (overlay.parentNode) document.body.removeChild(overlay);
+      if (onAllow) onAllow();
+    });
 
-      dialog.querySelector('#adx-agent-deny').addEventListener('click', () => {
-        document.body.removeChild(overlay);
-        resolve(false);
-      });
+    dialog.querySelector('#adx-agent-deny').addEventListener('click', () => {
+      if (overlay.parentNode) document.body.removeChild(overlay);
+      if (onDeny) onDeny();
     });
   }
 
