@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 /**
- * ADX Dashboard Agent Server (Node.js - Zero Dependencies)
+ * ADX Dashboard Agent Server (Node.js)
  * 
  * A simple HTTP server that bridges between AI agents and the Chrome extension.
  * Uses long polling for instant response without WebSocket dependencies.
+ * The only third-party dependency is the validator (ajv), and it is loaded
+ * lazily so read-only commands work even before `npm install`.
  * 
  * Usage:
  *     node agent-server.js [--port 9876]
@@ -24,6 +26,27 @@ const EDIT_TIMEOUT_MS = 120000;
 const GET_TIMEOUT_MS = 10000;
 const ACTION_TIMEOUT_MS = 10000;
 const POLL_TIMEOUT_MS = 30000;
+
+// Server-side validation is the authoritative gate: even if an agent bypasses
+// client.js and POSTs raw JSON, a malformed dashboard never reaches the browser.
+// ADX_SKIP_VALIDATION=1 is a deliberate escape hatch for the rare case where
+// ADX's own published schema is wrong; it disables this gate.
+const SKIP_VALIDATION = process.env.ADX_SKIP_VALIDATION === '1';
+
+// Loaded lazily so read-only commands keep working even when deps are missing.
+// Only the edit path needs the validator.
+let _validateDashboard = null;
+let _validatorLoadError = null;
+function getValidator() {
+  if (!_validateDashboard && !_validatorLoadError) {
+    try {
+      _validateDashboard = require('../validate.js').validateDashboard;
+    } catch (e) {
+      _validatorLoadError = e;
+    }
+  }
+  return { fn: _validateDashboard, err: _validatorLoadError };
+}
 
 // In-memory stores
 const pendingEdits = new Map();
@@ -80,7 +103,8 @@ function handlePollResponse(res, dashboardId) {
           dashboard: edit.dashboard,
           description: edit.description,
           skipConfirmation: edit.skipConfirmation,
-          filename: edit.filename
+          filename: edit.filename,
+          expiresAt: edit.expiresAt
         }
       });
       return;
@@ -134,6 +158,36 @@ async function handleEdit(req, res, dashboardIdFromPath) {
     return sendJson(res, { error: 'Missing dashboard field' }, 400);
   }
 
+  // Validate before queuing so a bad edit can never reach the browser, even when
+  // the caller skipped client.js and hit this endpoint directly.
+  if (!SKIP_VALIDATION) {
+    const { fn, err } = getValidator();
+    if (err) {
+      return sendJson(res, {
+        error: 'Validation could not run on the server',
+        detail: err.message,
+        hint: 'Run `npm install` in the adx-dashboard-live-edit skill so the validator (ajv) is available, or set ADX_SKIP_VALIDATION=1 to bypass.'
+      }, 500);
+    }
+    let validation;
+    try {
+      validation = await fn(data.dashboard);
+    } catch (e) {
+      return sendJson(res, {
+        error: 'Validation could not run on the server',
+        detail: e.message,
+        hint: 'Check network access to the ADX schema host or a populated .cache/schema dir.'
+      }, 500);
+    }
+    if (!validation.valid) {
+      return sendJson(res, {
+        error: 'Dashboard failed schema validation; edit not applied',
+        validationErrors: validation.errors,
+        hint: 'Fix the JSON in the authoring skill and re-validate before applying.'
+      }, 400);
+    }
+  }
+
   const editId = randomUUID();
   const dashboardId = dashboardIdFromPath || data.dashboardId || '*';
 
@@ -145,6 +199,7 @@ async function handleEdit(req, res, dashboardIdFromPath) {
     skipConfirmation: data.skipConfirmation || false,
     filename: data.filename || 'agent-edit.json',
     createdAt: Date.now(),
+    expiresAt: Date.now() + EDIT_TIMEOUT_MS,
     result: null,
     resolve: null
   };
@@ -245,7 +300,8 @@ async function handlePoll(req, res) {
           dashboard: edit.dashboard,
           description: edit.description,
           skipConfirmation: edit.skipConfirmation,
-          filename: edit.filename
+          filename: edit.filename,
+          expiresAt: edit.expiresAt
         }
       });
     }
@@ -505,7 +561,7 @@ async function handleSelectPage(req, res, dashboardIdFromPath) {
   });
 
   pendingActions.set(actionId, action);
-  log(`Select page: ${pageIdOrName} on dashboard ${targetDashboard}`);
+  log(`Select page: ${pageIdOrName} on dashboard ${dashboardId}`);
   notifyPollers();
 
   const timeoutPromise = new Promise((resolve) =>

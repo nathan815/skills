@@ -69,6 +69,30 @@
     }
   }
 
+  // Poll a predicate until it returns a truthy value or the timeout elapses.
+  // Returns the truthy value, or null on timeout. This is the basis for the
+  // edit flow's bounded waits so we never block forever on a dialog that
+  // never appears.
+  function waitFor(predicate, { timeout = 8000, interval = 100 } = {}) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const tick = () => {
+        let value = null;
+        try { value = predicate(); } catch (e) { value = null; }
+        if (value) { resolve(value); return; }
+        if (Date.now() - start >= timeout) { resolve(null); return; }
+        setTimeout(tick, interval);
+      };
+      tick();
+    });
+  }
+
+  function findConfirmButton() {
+    return document.querySelector('[data-testid="confirm-button"]') ||
+      Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Continue') ||
+      null;
+  }
+
   window.__adxAgent = {
     version: '1.0.0',
     authorizedDashboards,
@@ -184,18 +208,34 @@
         const skipConfirmation = options.skipConfirmation || false;
         const filename = options.filename || 'agent-update.json';
 
+        // How long to wait for ADX to react to the uploaded file (validation
+        // error or confirm dialog) and how long to wait for the dialog to close
+        // after we click Continue. Both stay well under the server EDIT_TIMEOUT.
+        const CONFIRM_WAIT_MS = 8000;
+        const APPLY_WAIT_MS = 8000;
+
         if (!dashboardJson || typeof dashboardJson !== 'object') {
           reject(new Error('Invalid dashboard JSON'));
           return;
         }
 
         if (!dashboardJson.schema_version) {
-          dashboardJson.schema_version = 75;
+          dashboardJson.schema_version = 76;
         }
 
         const jsonContent = JSON.stringify(dashboardJson, null, 2);
         const originalClick = HTMLInputElement.prototype.click;
         let intercepted = false;
+
+        // Restore the patched prototype no matter which path we exit through,
+        // so a failed file-menu lookup never leaks a global monkeypatch.
+        function restoreClick() {
+          if (HTMLInputElement.prototype.click !== originalClick) {
+            HTMLInputElement.prototype.click = originalClick;
+          }
+        }
+        const done = (result) => { restoreClick(); resolve(result); };
+        const fail = (err) => { restoreClick(); reject(err); };
 
         HTMLInputElement.prototype.click = function() {
           if (this.type === 'file' && this.accept === '.json' && !intercepted) {
@@ -206,32 +246,63 @@
             dt.items.add(file);
             this.files = dt.files;
 
-            setTimeout(() => {
+            setTimeout(async () => {
               this.dispatchEvent(new Event('change', { bubbles: true }));
               HTMLInputElement.prototype.click = originalClick;
 
-              // Wait for validation, then check for errors or success
-              setTimeout(() => {
-                // Check for validation error dialog
+              // Wait for one of three outcomes: a validation error dialog, the
+              // confirm/Continue dialog, or neither (timeout). The old code
+              // waited a fixed 800ms then checked once, which silently "hung"
+              // when the dialog was slow to appear.
+              const outcome = await waitFor(() => {
                 const errorText = extractValidationErrors();
-                if (errorText) {
-                  reject(new Error(errorText));
-                  return;
-                }
+                if (errorText) return { kind: 'error', errorText };
+                const continueBtn = findConfirmButton();
+                if (continueBtn) return { kind: 'confirm', continueBtn };
+                return null;
+              }, { timeout: CONFIRM_WAIT_MS });
 
-                if (skipConfirmation) {
-                  const continueBtn = document.querySelector('[data-testid="confirm-button"]') ||
-                    Array.from(document.querySelectorAll('button')).find(b => b.textContent === 'Continue');
-                  if (continueBtn) {
-                    continueBtn.click();
-                    resolve({ success: true, message: 'Dashboard replaced (auto-confirmed)' });
-                  } else {
-                    resolve({ success: true, message: 'Dashboard injected, waiting for confirmation' });
-                  }
-                } else {
-                  resolve({ success: true, message: 'Dashboard injected, waiting for confirmation' });
-                }
-              }, 800);
+              if (!outcome) {
+                fail(new Error('Timed out waiting for ADX to react to the uploaded dashboard (no validation error and no confirm dialog appeared)'));
+                return;
+              }
+
+              if (outcome.kind === 'error') {
+                fail(new Error(outcome.errorText));
+                return;
+              }
+
+              // Confirm dialog is open. Without auto-confirm we report it as a
+              // distinct state instead of pretending the edit succeeded.
+              if (!skipConfirmation) {
+                done({
+                  success: true,
+                  pendingConfirmation: true,
+                  message: 'Dashboard uploaded; confirmation dialog is open and awaiting confirmation'
+                });
+                return;
+              }
+
+              outcome.continueBtn.click();
+
+              // Confirm the dialog actually closed (edit applied) and surface a
+              // late validation error if ADX rejects it after confirming.
+              const settled = await waitFor(() => {
+                const lateError = extractValidationErrors();
+                if (lateError) return { kind: 'error', lateError };
+                if (!findConfirmButton()) return { kind: 'applied' };
+                return null;
+              }, { timeout: APPLY_WAIT_MS });
+
+              if (!settled) {
+                fail(new Error('Clicked Continue but the confirmation dialog did not close; the edit may not have applied'));
+                return;
+              }
+              if (settled.kind === 'error') {
+                fail(new Error(settled.lateError));
+                return;
+              }
+              done({ success: true, message: 'Dashboard replaced (auto-confirmed)' });
             }, 50);
 
             return;
@@ -239,7 +310,7 @@
           return originalClick.call(this);
         };
 
-        this._clickFileReplace().then(() => {}).catch(reject);
+        this._clickFileReplace().then(() => {}).catch(fail);
       });
     },
 
@@ -374,6 +445,17 @@
       await sendEditResult(editId, { 
         success: false, 
         error: `Dashboard ID mismatch: edit is for ${edit.dashboardId}, current is ${dashboardId}` 
+      });
+      return;
+    }
+
+    // The daemon deletes a pending edit once it times out and returns a failure
+    // to the agent. If authorization took longer than that window, applying now
+    // would silently mutate the dashboard after the agent already moved on.
+    if (edit.expiresAt && Date.now() > edit.expiresAt) {
+      await sendEditResult(editId, {
+        success: false,
+        error: 'Edit expired before it could be applied (the daemon already timed out). Re-run the edit.'
       });
       return;
     }
