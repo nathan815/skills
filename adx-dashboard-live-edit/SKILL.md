@@ -66,6 +66,11 @@ If installed globally (e.g. via npm), the same commands are available as
    - The client re-validates against the schema first. If it is invalid, the edit
      is aborted and the validation errors are printed. Nothing reaches the browser.
    - On success the edit is applied and ADX's confirm dialog is auto-confirmed.
+   - **First edit may need approval.** If the dashboard has not been authorized yet,
+     the command does not hang waiting for a click. It returns immediately with
+     `pendingAuthorization: true` (exit code 2) and an approval overlay appears in the
+     browser tab. Tell the user to click "Allow Edits", then re-run the exact same
+     `edit` command. Do not treat this as a hard failure and do not switch write paths.
 5. **Check tile errors**: `node client.js errors <id>`. If a tile failed (e.g. a bad
    column name), go back to step 3, fix the JSON, and apply again.
 
@@ -106,10 +111,13 @@ work around.
 
 ## Security model
 
-- **First-time authorization**: the user must click "Allow Edits" the first time an
-  agent edits a given dashboard.
-- **Per-dashboard and expires on refresh**: authorization is scoped to one dashboard
-  and is cleared when the page refreshes, so re-authorization may be needed.
+- **First-time authorization**: the first edit to a given dashboard returns
+  `pendingAuthorization` (exit code 2) and shows an "Allow Edits" overlay in the tab
+  instead of blocking. The user clicks Allow, then the agent re-runs the same edit.
+- **Per-dashboard, persisted for 12 hours**: a grant is scoped to one dashboard and
+  stored in the page's localStorage with a 12h TTL, so it survives reloads and the
+  user is not re-prompted on every refresh. After it expires, the next edit prompts
+  again. "Deny" clears the grant.
 - **Localhost only**: the daemon listens on `127.0.0.1:9876` with no external access.
 
 ## Notes
