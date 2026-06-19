@@ -1,0 +1,21 @@
+{
+  "name": "adx-dashboard-authoring",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Author and validate Azure Data Explorer dashboard JSON against the official ADX schema.",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "adx-validate": "scripts/validate.js",
+    "adx-get-schema": "scripts/get-schema.js",
+    "adx-get-dashboard": "scripts/get-dashboard.js",
+    "adx-list-dashboards": "scripts/list-dashboards.js"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.5.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  }
+}

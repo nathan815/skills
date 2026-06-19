@@ -3,13 +3,60 @@
 
   const AGENT_SERVER_PORT = 9876;
   const authorizedDashboards = new Set();
+  const pendingAuthDashboards = new Set();
   const handledEditIds = new Set();
-  let dialogOpen = false;
   let polling = false;
+
+  // Persisted authorization survives page reloads so the user is not re-prompted
+  // on every refresh. It is time-boxed: a grant expires after this window and the
+  // overlay appears again, keeping the localhost consent gate meaningful.
+  const AUTH_STORAGE_PREFIX = 'adxAgentAuth:';
+  const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
 
   function getCurrentDashboardId() {
     const match = window.location.pathname.match(/\/dashboards\/([a-f0-9-]+)/i);
     return match ? match[1] : null;
+  }
+
+  function isAuthorized(dashboardId) {
+    if (authorizedDashboards.has(dashboardId)) return true;
+    // Fall back to a persisted grant so a reload does not force a re-prompt.
+    try {
+      const raw = localStorage.getItem(AUTH_STORAGE_PREFIX + dashboardId);
+      if (!raw) return false;
+      const rec = JSON.parse(raw);
+      if (rec && rec.expiresAt && Date.now() < rec.expiresAt) {
+        authorizedDashboards.add(dashboardId);
+        return true;
+      }
+      // Expired: drop it so the next edit prompts cleanly.
+      localStorage.removeItem(AUTH_STORAGE_PREFIX + dashboardId);
+    } catch (e) {
+      // localStorage can be unavailable in locked-down contexts; treat as unauthorized.
+    }
+    return false;
+  }
+
+  function persistAuthorization(dashboardId) {
+    authorizedDashboards.add(dashboardId);
+    try {
+      localStorage.setItem(AUTH_STORAGE_PREFIX + dashboardId, JSON.stringify({
+        dashboardId,
+        allowedAt: Date.now(),
+        expiresAt: Date.now() + AUTH_TTL_MS
+      }));
+    } catch (e) {
+      // Non-fatal: the in-memory grant still covers this page session.
+    }
+  }
+
+  function clearAuthorization(dashboardId) {
+    authorizedDashboards.delete(dashboardId);
+    try {
+      localStorage.removeItem(AUTH_STORAGE_PREFIX + dashboardId);
+    } catch (e) {
+      // Nothing to clean up if storage is unavailable.
+    }
   }
 
   function extractValidationErrors() {
@@ -67,6 +114,30 @@
     if (dismissBtn) {
       dismissBtn.click();
     }
+  }
+
+  // Poll a predicate until it returns a truthy value or the timeout elapses.
+  // Returns the truthy value, or null on timeout. This is the basis for the
+  // edit flow's bounded waits so we never block forever on a dialog that
+  // never appears.
+  function waitFor(predicate, { timeout = 8000, interval = 100 } = {}) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const tick = () => {
+        let value = null;
+        try { value = predicate(); } catch (e) { value = null; }
+        if (value) { resolve(value); return; }
+        if (Date.now() - start >= timeout) { resolve(null); return; }
+        setTimeout(tick, interval);
+      };
+      tick();
+    });
+  }
+
+  function findConfirmButton() {
+    return document.querySelector('[data-testid="confirm-button"]') ||
+      Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Continue') ||
+      null;
   }
 
   window.__adxAgent = {
@@ -184,18 +255,34 @@
         const skipConfirmation = options.skipConfirmation || false;
         const filename = options.filename || 'agent-update.json';
 
+        // How long to wait for ADX to react to the uploaded file (validation
+        // error or confirm dialog) and how long to wait for the dialog to close
+        // after we click Continue. Both stay well under the server EDIT_TIMEOUT.
+        const CONFIRM_WAIT_MS = 8000;
+        const APPLY_WAIT_MS = 8000;
+
         if (!dashboardJson || typeof dashboardJson !== 'object') {
           reject(new Error('Invalid dashboard JSON'));
           return;
         }
 
         if (!dashboardJson.schema_version) {
-          dashboardJson.schema_version = 75;
+          dashboardJson.schema_version = 76;
         }
 
         const jsonContent = JSON.stringify(dashboardJson, null, 2);
         const originalClick = HTMLInputElement.prototype.click;
         let intercepted = false;
+
+        // Restore the patched prototype no matter which path we exit through,
+        // so a failed file-menu lookup never leaks a global monkeypatch.
+        function restoreClick() {
+          if (HTMLInputElement.prototype.click !== originalClick) {
+            HTMLInputElement.prototype.click = originalClick;
+          }
+        }
+        const done = (result) => { restoreClick(); resolve(result); };
+        const fail = (err) => { restoreClick(); reject(err); };
 
         HTMLInputElement.prototype.click = function() {
           if (this.type === 'file' && this.accept === '.json' && !intercepted) {
@@ -206,32 +293,63 @@
             dt.items.add(file);
             this.files = dt.files;
 
-            setTimeout(() => {
+            setTimeout(async () => {
               this.dispatchEvent(new Event('change', { bubbles: true }));
               HTMLInputElement.prototype.click = originalClick;
 
-              // Wait for validation, then check for errors or success
-              setTimeout(() => {
-                // Check for validation error dialog
+              // Wait for one of three outcomes: a validation error dialog, the
+              // confirm/Continue dialog, or neither (timeout). The old code
+              // waited a fixed 800ms then checked once, which silently "hung"
+              // when the dialog was slow to appear.
+              const outcome = await waitFor(() => {
                 const errorText = extractValidationErrors();
-                if (errorText) {
-                  reject(new Error(errorText));
-                  return;
-                }
+                if (errorText) return { kind: 'error', errorText };
+                const continueBtn = findConfirmButton();
+                if (continueBtn) return { kind: 'confirm', continueBtn };
+                return null;
+              }, { timeout: CONFIRM_WAIT_MS });
 
-                if (skipConfirmation) {
-                  const continueBtn = document.querySelector('[data-testid="confirm-button"]') ||
-                    Array.from(document.querySelectorAll('button')).find(b => b.textContent === 'Continue');
-                  if (continueBtn) {
-                    continueBtn.click();
-                    resolve({ success: true, message: 'Dashboard replaced (auto-confirmed)' });
-                  } else {
-                    resolve({ success: true, message: 'Dashboard injected, waiting for confirmation' });
-                  }
-                } else {
-                  resolve({ success: true, message: 'Dashboard injected, waiting for confirmation' });
-                }
-              }, 800);
+              if (!outcome) {
+                fail(new Error('Timed out waiting for ADX to react to the uploaded dashboard (no validation error and no confirm dialog appeared)'));
+                return;
+              }
+
+              if (outcome.kind === 'error') {
+                fail(new Error(outcome.errorText));
+                return;
+              }
+
+              // Confirm dialog is open. Without auto-confirm we report it as a
+              // distinct state instead of pretending the edit succeeded.
+              if (!skipConfirmation) {
+                done({
+                  success: true,
+                  pendingConfirmation: true,
+                  message: 'Dashboard uploaded; confirmation dialog is open and awaiting confirmation'
+                });
+                return;
+              }
+
+              outcome.continueBtn.click();
+
+              // Confirm the dialog actually closed (edit applied) and surface a
+              // late validation error if ADX rejects it after confirming.
+              const settled = await waitFor(() => {
+                const lateError = extractValidationErrors();
+                if (lateError) return { kind: 'error', lateError };
+                if (!findConfirmButton()) return { kind: 'applied' };
+                return null;
+              }, { timeout: APPLY_WAIT_MS });
+
+              if (!settled) {
+                fail(new Error('Clicked Continue but the confirmation dialog did not close; the edit may not have applied'));
+                return;
+              }
+              if (settled.kind === 'error') {
+                fail(new Error(settled.lateError));
+                return;
+              }
+              done({ success: true, message: 'Dashboard replaced (auto-confirmed)' });
             }, 50);
 
             return;
@@ -239,7 +357,7 @@
           return originalClick.call(this);
         };
 
-        this._clickFileReplace().then(() => {}).catch(reject);
+        this._clickFileReplace().then(() => {}).catch(fail);
       });
     },
 
@@ -359,21 +477,50 @@
     const dashboardId = getCurrentDashboardId();
     const editId = edit.id;
 
-    if (!authorizedDashboards.has(dashboardId)) {
-      dialogOpen = true;
-      const confirmed = await showAuthorizationDialog(dashboardId, edit);
-      dialogOpen = false;
-      if (!confirmed) {
-        await sendEditResult(editId, { success: false, error: 'User declined authorization' });
-        return;
-      }
-      authorizedDashboards.add(dashboardId);
+    if (!dashboardId) {
+      await sendEditResult(editId, { success: false, error: 'No dashboard is currently open in this tab' });
+      return;
     }
 
+    // Validate the edit can actually apply here BEFORE asking for authorization.
+    // Prompting (and persisting a grant) for a mismatched or expired edit would
+    // bless the wrong dashboard or mutate it after the agent already gave up.
     if (edit.dashboardId && edit.dashboardId !== '*' && edit.dashboardId !== dashboardId) {
-      await sendEditResult(editId, { 
-        success: false, 
-        error: `Dashboard ID mismatch: edit is for ${edit.dashboardId}, current is ${dashboardId}` 
+      await sendEditResult(editId, {
+        success: false,
+        error: `Dashboard ID mismatch: edit is for ${edit.dashboardId}, current is ${dashboardId}`
+      });
+      return;
+    }
+
+    // The daemon deletes a pending edit once it times out and returns a failure
+    // to the agent. If we applied a stale edit now, the dashboard would change
+    // silently after the agent already moved on.
+    if (edit.expiresAt && Date.now() > edit.expiresAt) {
+      await sendEditResult(editId, {
+        success: false,
+        error: 'Edit expired before it could be applied (the daemon already timed out). Re-run the edit.'
+      });
+      return;
+    }
+
+    // Authorization is a human consent gate. The overlay used to be awaited here,
+    // which hung the whole edit (and the agent) until the user happened to click,
+    // or until the daemon timed out 120s later. Instead, surface the overlay and
+    // return an actionable result immediately: the user clicks "Allow Edits", then
+    // the agent re-runs the edit, which now passes this check.
+    if (!isAuthorized(dashboardId)) {
+      if (!pendingAuthDashboards.has(dashboardId)) {
+        pendingAuthDashboards.add(dashboardId);
+        showAuthorizationDialog(dashboardId, {
+          onAllow: () => { pendingAuthDashboards.delete(dashboardId); persistAuthorization(dashboardId); },
+          onDeny: () => { pendingAuthDashboards.delete(dashboardId); clearAuthorization(dashboardId); }
+        });
+      }
+      await sendEditResult(editId, {
+        success: false,
+        pendingAuthorization: true,
+        error: "Authorization required: an approval dialog is open in the ADX browser tab. Click 'Allow Edits' to grant this agent permission for this dashboard, then re-run the edit."
       });
       return;
     }
@@ -389,62 +536,61 @@
     }
   }
 
-  async function showAuthorizationDialog(dashboardId, edit) {
-    return new Promise((resolve) => {
-      const overlay = document.createElement('div');
-      overlay.style.cssText = `
-        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-        background: rgba(0,0,0,0.5); z-index: 999999;
-        display: flex; align-items: center; justify-content: center;
-      `;
+  // Non-blocking by design: render the consent overlay and fire onAllow/onDeny
+  // when the user clicks. The edit path no longer awaits this, so a dialog left
+  // unclicked can never hang the agent. The "Allow" handler persists the grant.
+  function showAuthorizationDialog(dashboardId, { onAllow, onDeny } = {}) {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = `
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.5); z-index: 999999;
+      display: flex; align-items: center; justify-content: center;
+    `;
 
-      const dialog = document.createElement('div');
-      dialog.style.cssText = `
-        background: white; padding: 24px; border-radius: 8px;
-        max-width: 500px; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      `;
+    const dialog = document.createElement('div');
+    dialog.style.cssText = `
+      background: white; padding: 24px; border-radius: 8px;
+      max-width: 500px; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    `;
 
-      const currentDashboard = window.__adxAgent.getDashboard();
-      const title = currentDashboard.title || 'Unknown Dashboard';
+    const currentDashboard = window.__adxAgent.getDashboard();
+    const title = currentDashboard.title || 'Unknown Dashboard';
 
-      dialog.innerHTML = `
-        <h2 style="margin: 0 0 16px 0; color: #0078d4;">🤖 Agent Edit Request</h2>
-        <p style="margin: 0 0 12px 0;">An agent wants to edit this dashboard:</p>
-        <p style="margin: 0 0 12px 0; padding: 12px; background: #f3f3f3; border-radius: 4px;">
-          <strong>${title}</strong><br>
-          <code style="font-size: 12px; color: #666;">${dashboardId}</code>
-        </p>
-        <p style="margin: 0 0 16px 0; font-size: 14px; color: #666;">
-          ${edit.description || 'No description provided'}
-        </p>
-        <p style="margin: 0 0 16px 0; font-size: 13px; color: #a4262c;">
-          ⚠️ This will allow the agent to modify this dashboard until you refresh the page.
-        </p>
-        <div style="display: flex; gap: 12px; justify-content: flex-end;">
-          <button id="adx-agent-deny" style="
-            padding: 8px 16px; border: 1px solid #ccc; border-radius: 4px;
-            background: white; cursor: pointer; font-size: 14px;
-          ">Deny</button>
-          <button id="adx-agent-allow" style="
-            padding: 8px 16px; border: none; border-radius: 4px;
-            background: #0078d4; color: white; cursor: pointer; font-size: 14px;
-          ">Allow Edits</button>
-        </div>
-      `;
+    dialog.innerHTML = `
+      <h2 style="margin: 0 0 16px 0; color: #0078d4;">🤖 Agent Edit Request</h2>
+      <p style="margin: 0 0 12px 0;">An agent wants to edit this dashboard:</p>
+      <p style="margin: 0 0 12px 0; padding: 12px; background: #f3f3f3; border-radius: 4px;">
+        <strong>${title}</strong><br>
+        <code style="font-size: 12px; color: #666;">${dashboardId}</code>
+      </p>
+      <p style="margin: 0 0 16px 0; font-size: 13px; color: #a4262c;">
+        ⚠️ Allowing grants this agent permission to modify this dashboard for the
+        next 12 hours (it survives page reloads). Deny to refuse.
+      </p>
+      <div style="display: flex; gap: 12px; justify-content: flex-end;">
+        <button id="adx-agent-deny" style="
+          padding: 8px 16px; border: 1px solid #ccc; border-radius: 4px;
+          background: white; cursor: pointer; font-size: 14px;
+        ">Deny</button>
+        <button id="adx-agent-allow" style="
+          padding: 8px 16px; border: none; border-radius: 4px;
+          background: #0078d4; color: white; cursor: pointer; font-size: 14px;
+        ">Allow Edits</button>
+      </div>
+    `;
 
-      overlay.appendChild(dialog);
-      document.body.appendChild(overlay);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
 
-      dialog.querySelector('#adx-agent-allow').addEventListener('click', () => {
-        document.body.removeChild(overlay);
-        resolve(true);
-      });
+    dialog.querySelector('#adx-agent-allow').addEventListener('click', () => {
+      if (overlay.parentNode) document.body.removeChild(overlay);
+      if (onAllow) onAllow();
+    });
 
-      dialog.querySelector('#adx-agent-deny').addEventListener('click', () => {
-        document.body.removeChild(overlay);
-        resolve(false);
-      });
+    dialog.querySelector('#adx-agent-deny').addEventListener('click', () => {
+      if (overlay.parentNode) document.body.removeChild(overlay);
+      if (onDeny) onDeny();
     });
   }
 
